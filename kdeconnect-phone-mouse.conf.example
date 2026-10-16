@@ -1,0 +1,7 @@
+# ~/.config/kdeconnect-phone-mouse.conf
+# Command-line options for the service. Run `kdeconnect-phone-mouse --help`
+# for the full list, then: systemctl --user restart kdeconnect-phone-mouse
+#
+# Phone lying below the left quarter of the bottom-left screen, 1440x3120 panel:
+#   ARGS=--edge bottom --zone 0,0 --span 0,0.25 --phone-w 1440 --phone-h 3120
+ARGS=--edge right

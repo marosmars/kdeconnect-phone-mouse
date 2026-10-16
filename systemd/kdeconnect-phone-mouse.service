@@ -1,0 +1,16 @@
+[Unit]
+Description=Move the mouse onto an Android phone across a screen edge (KDE Connect)
+Documentation=https://github.com/marosmars/kdeconnect-phone-mouse
+PartOf=graphical-session.target
+After=graphical-session.target plasma-kwin_wayland.service
+StartLimitIntervalSec=0
+
+[Service]
+# Options go in ARGS=... in this file, e.g. ARGS=--edge bottom --span 0,0.25
+EnvironmentFile=-%h/.config/kdeconnect-phone-mouse.conf
+ExecStart=%h/.local/bin/kdeconnect-phone-mouse $ARGS
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

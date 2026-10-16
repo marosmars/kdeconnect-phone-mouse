@@ -1,0 +1,615 @@
+#!/usr/bin/env python3
+"""kdeconnect-phone-mouse: move the PC mouse off a screen edge onto an
+Android phone, as if the phone were another monitor.
+
+PC side:   KWin's input-capture D-Bus API (what the InputCapture portal uses
+           underneath, minus the permission dialog) puts a pointer barrier
+           on a stretch of one screen edge; once crossed, libei delivers raw
+           pointer events. A thin line on that edge marks the crossing.
+Phone side: KDE Connect remotecontrol plugin (D-Bus) -> Android
+           "Mouse receiver" plugin (accessibility service).
+
+Return to the PC by pushing back out of the phone's entry edge, or
+Meta+Shift+Esc.
+
+https://github.com/marosmars/kdeconnect-phone-mouse
+SPDX-License-Identifier: MIT
+"""
+
+__version__ = "0.1.0"
+
+import argparse
+import ctypes
+import os
+import json
+import subprocess
+import signal
+import sys
+import time
+
+import dbus
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib
+
+# --- libei (receiver) --------------------------------------------------------
+
+EI_EVENT_CONNECT = 1
+EI_EVENT_DISCONNECT = 2
+EI_EVENT_SEAT_ADDED = 3
+EI_EVENT_DEVICE_START_EMULATING = 200
+EI_EVENT_DEVICE_STOP_EMULATING = 201
+EI_EVENT_POINTER_MOTION = 300
+EI_EVENT_BUTTON_BUTTON = 500
+EI_EVENT_SCROLL_DELTA = 600
+EI_EVENT_SCROLL_DISCRETE = 603
+
+EI_DEVICE_CAP_POINTER = 1 << 0
+EI_DEVICE_CAP_SCROLL = 1 << 4
+EI_DEVICE_CAP_BUTTON = 1 << 5
+
+BTN_LEFT, BTN_RIGHT, BTN_MIDDLE = 0x110, 0x111, 0x112
+
+ei = ctypes.CDLL("libei.so.1")
+P = ctypes.c_void_p
+for name, res, args in [
+    ("ei_new_receiver", P, [P]),
+    ("ei_configure_name", None, [P, ctypes.c_char_p]),
+    ("ei_setup_backend_fd", ctypes.c_int, [P, ctypes.c_int]),
+    ("ei_get_fd", ctypes.c_int, [P]),
+    ("ei_dispatch", None, [P]),
+    ("ei_get_event", P, [P]),
+    ("ei_event_unref", P, [P]),
+    ("ei_event_get_type", ctypes.c_int, [P]),
+    ("ei_event_get_seat", P, [P]),
+    ("ei_event_pointer_get_dx", ctypes.c_double, [P]),
+    ("ei_event_pointer_get_dy", ctypes.c_double, [P]),
+    ("ei_event_button_get_button", ctypes.c_uint32, [P]),
+    ("ei_event_button_get_is_press", ctypes.c_bool, [P]),
+    ("ei_event_scroll_get_dy", ctypes.c_double, [P]),
+    ("ei_event_scroll_get_discrete_dy", ctypes.c_int32, [P]),
+]:
+    fn = getattr(ei, name)
+    fn.restype, fn.argtypes = res, args
+ei.ei_seat_bind_capabilities.restype = None  # variadic, NULL-terminated
+
+# --- KWin input capture -----------------------------------------------------
+
+DBusGMainLoop(set_as_default=True)
+bus = dbus.SessionBus()
+KWIN = "org.kde.KWin"
+CAPTURE_IFACE = "org.kde.KWin.EIS.InputCapture"
+
+
+class KWinCapture:
+    """Direct client of KWin's EIS input capture (no portal, no dialog).
+
+    Internal KWin API: Plasma 6.6 takes barriers as a((ii)(ii)), KWin master
+    as a(u(ii)(ii)) with ids. Both are handled.
+    """
+
+    def __init__(self, on_activated, on_deactivated, on_disabled):
+        mgr = dbus.Interface(bus.get_object(KWIN, "/org/kde/KWin/EIS/InputCapture"),
+                             "org.kde.KWin.EIS.InputCaptureManager")
+        self.path = mgr.addInputCapture(dbus.UInt32(2))  # pointer only
+        obj = bus.get_object(KWIN, self.path)
+        self.cap = dbus.Interface(obj, CAPTURE_IFACE)
+        xml = obj.Introspect(dbus_interface="org.freedesktop.DBus.Introspectable")
+        self.with_ids = 'type="a(u(ii)(ii))"' in xml
+        for sig, cb in [("activated", on_activated), ("deactivated", on_deactivated),
+                        ("disabled", on_disabled)]:
+            bus.add_signal_receiver(cb, sig, CAPTURE_IFACE, KWIN, self.path)
+
+    def connect_eis(self):
+        return self.cap.connectToEIS().take()
+
+    def enable(self, x1, y1, x2, y2):
+        p1 = dbus.Struct((x1, y1), signature="ii")
+        p2 = dbus.Struct((x2, y2), signature="ii")
+        if self.with_ids:
+            barrier = dbus.Struct((dbus.UInt32(1), p1, p2), signature="u(ii)(ii)")
+            self.cap.enable(dbus.Array([barrier], signature="(u(ii)(ii))"))
+        else:
+            barrier = dbus.Struct((p1, p2), signature="(ii)(ii)")
+            self.cap.enable(dbus.Array([barrier], signature="((ii)(ii))"))
+
+    def disable(self):
+        self.cap.disable()
+
+    def release(self, x, y):
+        self.cap.release(dbus.Struct((float(x), float(y)), signature="dd"), True)
+
+
+def screens():
+    """Logical geometry (x, y, w, h) of enabled outputs, from kscreen-doctor."""
+    out = json.loads(subprocess.run(["kscreen-doctor", "-j"], capture_output=True,
+                                    text=True, check=True).stdout)
+    result = []
+    for o in out["outputs"]:
+        if not o["enabled"]:
+            continue
+        w, h = o["size"]["width"] / o["scale"], o["size"]["height"] / o["scale"]
+        if o.get("rotation") in (2, 8):  # 90 / 270 degrees
+            w, h = h, w
+        result.append((o["pos"]["x"], o["pos"]["y"], round(w), round(h)))
+    return sorted(result)
+
+
+# --- phone (KDE Connect) -----------------------------------------------------
+
+
+class Phone:
+    def __init__(self, device_id):
+        self.dev_path = f"/modules/kdeconnect/devices/{device_id}"
+        obj = bus.get_object("org.kde.kdeconnect", f"{self.dev_path}/remotecontrol",
+                             introspect=False)
+        self.rc = dbus.Interface(obj, "org.kde.kdeconnect.device.remotecontrol")
+
+    def reachable(self):
+        try:
+            obj = bus.get_object("org.kde.kdeconnect", self.dev_path, introspect=False)
+            return bool(dbus.Interface(obj, dbus.PROPERTIES_IFACE).Get(
+                "org.kde.kdeconnect.device", "isReachable"))
+        except dbus.DBusException:
+            return False  # kdeconnectd not running, or device unknown
+
+    def watch(self, callback):
+        """Call callback(bool) on reachability changes (signal + 30 s poll)."""
+        bus.add_signal_receiver(lambda r: callback(bool(r)), "reachableChanged",
+                                "org.kde.kdeconnect.device", None, self.dev_path)
+        GLib.timeout_add_seconds(30, lambda: callback(self.reachable()) or True)
+
+    def _ignore(self, *a):
+        pass
+
+    def _err(self, e):
+        print("kdeconnect:", e, file=sys.stderr)
+
+    def move(self, dx, dy):
+        self.rc.moveCursor(
+            dbus.Struct((int(dx), int(dy)), signature="ii"),
+            reply_handler=self._ignore, error_handler=self._err,
+        )
+
+    def command(self, **body):
+        self.rc.sendCommand(
+            dbus.Dictionary(body, signature="sv"),
+            reply_handler=self._ignore, error_handler=self._err,
+        )
+
+
+# --- geometry ----------------------------------------------------------------
+
+
+def outermost(screens, edge):
+    """The screen whose `edge` side is furthest out (x, y, w, h tuples)."""
+    key = {"right": lambda z: z[0] + z[2], "bottom": lambda z: z[1] + z[3],
+           "left": lambda z: -z[0], "top": lambda z: -z[1]}[edge]
+    return max(screens, key=key)
+
+# PC exit edge -> outward unit vector on the phone (pushing this way returns)
+OUTWARD = {"bottom": (0, -1), "top": (0, 1), "right": (-1, 0), "left": (1, 0)}
+
+
+class Edge:
+    """One stretch of one screen edge, and the matching phone edge."""
+
+    def __init__(self, zone, edge, span, phone_w, phone_h):
+        self.edge, self.pw, self.ph = edge, phone_w, phone_h
+        zx, zy, zw, zh = zone
+        self.zone = (zx, zy, zw, zh)
+        horizontal = edge in ("top", "bottom")
+        lo, length = (zx, zw) if horizontal else (zy, zh)
+        self.start = lo + round(span[0] * length)
+        self.end = lo + round(span[1] * length)
+        self.fixed = {"bottom": zy + zh, "top": zy, "right": zx + zw, "left": zx}[edge]
+        self.inset = {"bottom": -20, "top": 20, "right": -20, "left": 20}[edge]
+        self.horizontal = horizontal
+        self.ox, self.oy = OUTWARD[edge]
+
+    def barrier(self):
+        """KWin barrier: the screen's outermost pixel row/column, span only."""
+        row = self.fixed - 1 if self.edge in ("bottom", "right") else self.fixed
+        if self.horizontal:
+            return (self.start, row, self.end - 1, row)
+        return (row, self.start, row, self.end - 1)
+
+    def phone_entry(self, pc_x, pc_y):
+        """Phone pointer position for a crossing at PC point (pc_x, pc_y)."""
+        along = pc_x if self.horizontal else pc_y
+        t = min(max((along - self.start) / (self.end - self.start), 0.0), 1.0)
+        if self.horizontal:
+            return t * self.pw, (1.0 if self.edge == "bottom" else self.ph - 1.0)
+        return (1.0 if self.edge == "right" else self.pw - 1.0), t * self.ph
+
+    def pc_return(self, px, py):
+        """PC cursor position when leaving the phone at (px, py)."""
+        t = px / self.pw if self.horizontal else py / self.ph
+        along = self.start + t * (self.end - self.start)
+        across = self.fixed + self.inset
+        return (along, across) if self.horizontal else (across, along)
+
+
+# --- edge indicator ----------------------------------------------------------
+
+
+class Indicator:
+    """Thin click-through line on the crossing stretch (gtk-layer-shell)."""
+
+    CSS = b"""
+    window { background-color: rgba(61, 174, 233, 0.55); }
+    window.active { background-color: rgba(246, 116, 0, 0.95); }
+    """
+
+    def __init__(self, edge, thickness):
+        import gi
+        gi.require_version("Gtk", "3.0")
+        gi.require_version("Gdk", "3.0")
+        gi.require_version("GtkLayerShell", "0.1")
+        import cairo
+        from gi.repository import Gdk, Gtk, GtkLayerShell as LS
+
+        zx, zy, zw, zh = edge.zone
+        display = Gdk.Display.get_default()
+        monitor = next(
+            (m for m in (display.get_monitor(i) for i in range(display.get_n_monitors()))
+             if (m.get_geometry().x, m.get_geometry().y) == (zx, zy)), None)
+
+        provider = Gtk.CssProvider()
+        provider.load_from_data(self.CSS)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+        w = self.win = Gtk.Window()
+        LS.init_for_window(w)
+        LS.set_namespace(w, "phone-mouse-edge")
+        LS.set_layer(w, LS.Layer.OVERLAY)
+        LS.set_exclusive_zone(w, -1)  # sit on the real edge, over panels
+        if monitor:
+            LS.set_monitor(w, monitor)
+        length = edge.end - edge.start
+        offset = edge.start - (zx if edge.horizontal else zy)
+        side = {"bottom": LS.Edge.BOTTOM, "top": LS.Edge.TOP,
+                "right": LS.Edge.RIGHT, "left": LS.Edge.LEFT}[edge.edge]
+        LS.set_anchor(w, side, True)
+        if edge.horizontal:
+            LS.set_anchor(w, LS.Edge.LEFT, True)
+            LS.set_margin(w, LS.Edge.LEFT, offset)
+            w.set_size_request(length, thickness)
+        else:
+            LS.set_anchor(w, LS.Edge.TOP, True)
+            LS.set_margin(w, LS.Edge.TOP, offset)
+            w.set_size_request(thickness, length)
+        w.connect("realize", lambda *_: w.input_shape_combine_region(cairo.Region()))
+
+    def set_visible(self, on):
+        self.win.show_all() if on else self.win.hide()
+
+    def set_active(self, active):
+        ctx = self.win.get_style_context()
+        (ctx.add_class if active else ctx.remove_class)("active")
+
+
+# --- bridge ------------------------------------------------------------------
+
+
+class Bridge:
+    def __init__(self, args):
+        self.a = args
+        self.phone = Phone(args.device)
+        self.indicator = None
+        self.active = False
+        self.activation_id = None
+        self.px = self.py = 0.0          # estimated phone pointer, phone px
+        self.acc_x = self.acc_y = 0.0    # deltas not yet sent
+        self.push = 0.0                  # how far we pushed back out of the phone
+        self.left_down = False
+        self.drag = False
+        self.drag_dist = 0.0
+        self.last_discrete = 0.0
+        self.scroll_acc = 0.0            # pending scroll, phone px of finger travel
+        self.scroll_timer = None
+
+    def start(self):
+        self.screens = screens()
+        if self.a.zone:
+            zx, zy = self.a.zone
+            zone = next((z for z in self.screens
+                         if z[0] <= zx < z[0] + z[2] and z[1] <= zy < z[1] + z[3]), None)
+            if zone is None:
+                sys.exit(f"no screen at {zx},{zy}; screens: {self.screens}")
+        else:
+            zone = outermost(self.screens, self.a.edge)
+        self.edge = Edge(zone, self.a.edge, self.a.span, self.a.phone_w, self.a.phone_h)
+        print(f"screen {zone}, barrier {self.edge.barrier()}")
+
+        self.capture = KWinCapture(self.on_activated, self.on_deactivated,
+                                   self.on_disabled)
+        self.ctx = ei.ei_new_receiver(None)
+        ei.ei_configure_name(self.ctx, b"phone-mouse")
+        if ei.ei_setup_backend_fd(self.ctx, self.capture.connect_eis()) != 0:
+            sys.exit("ei_setup_backend_fd failed")
+        GLib.io_add_watch(ei.ei_get_fd(self.ctx), GLib.IO_IN, self.on_ei)
+        GLib.timeout_add(1000 // self.a.hz, self.flush)
+        GLib.timeout_add_seconds(5, self.check_screens)
+
+        if self.a.line:
+            try:
+                self.indicator = Indicator(self.edge, self.a.line)
+            except (ImportError, ValueError) as e:
+                print(f"no edge line ({e}); "
+                      "sudo apt install gir1.2-gtklayershell-0.1", file=sys.stderr)
+        self.enabled = None
+        self.phone.watch(self.set_enabled)
+        self.set_enabled(self.phone.reachable())
+
+    def set_enabled(self, on):
+        """Hold the barrier only while the phone is reachable."""
+        if on == self.enabled:
+            return
+        self.enabled = on
+        if not on and self.active:
+            self.release()
+        if on:
+            self.capture.enable(*self.edge.barrier())
+        else:
+            self.capture.disable()
+        if self.indicator:
+            self.indicator.set_visible(on)
+        print(f"phone {'reachable: cross the ' + self.a.edge + ' edge' if on else 'away: edge off'}")
+
+    def check_screens(self):
+        # Screens changed: geometry is stale. Let systemd restart us.
+        try:
+            changed = screens() != self.screens
+        except (OSError, subprocess.CalledProcessError, ValueError):
+            return True
+        if changed:
+            print("screens changed, restarting")
+            quit_with(3)
+        return True
+
+    def set_active(self, active):
+        self.active = active
+        if self.indicator:
+            self.indicator.set_active(active)
+
+    # KWin signals
+    def on_activated(self, activation_id, position, *rest):
+        # 6.6: (u, (dd)); KWin master: (u, u barrier, (dd))
+        if rest:
+            position = rest[0]
+        cx, cy = (float(v) for v in position)
+        self.px, self.py = self.edge.phone_entry(cx, cy)
+        self.phone.command(x=dbus.Int32(max(1, int(self.px))),
+                           y=dbus.Int32(max(1, int(self.py))))
+        self.push = 0.0
+        self.acc_x = self.acc_y = 0.0
+        self.set_active(True)
+        print(f"-> phone at {int(self.px)},{int(self.py)}")
+
+    def on_deactivated(self, activation_id):
+        self.set_active(False)
+
+    def on_disabled(self):
+        # Meta+Shift+Esc: KWin dropped the barrier. Put it back.
+        self.set_active(False)
+        print("capture disabled (escape key), re-arming")
+        if self.enabled:
+            GLib.timeout_add(1000, lambda: self.capture.enable(*self.edge.barrier()))
+
+    def release(self):
+        self.capture.release(*self.edge.pc_return(self.px, self.py))
+        self.set_active(False)
+        self.acc_x = self.acc_y = 0.0
+        print("<- pc")
+
+    # input
+    def on_ei(self, fd, cond):
+        ei.ei_dispatch(self.ctx)
+        while True:
+            ev = ei.ei_get_event(self.ctx)
+            if not ev:
+                break
+            try:
+                self.handle(ev, ei.ei_event_get_type(ev))
+            finally:
+                ei.ei_event_unref(ev)
+        return True
+
+    def handle(self, ev, t):
+        if t == EI_EVENT_SEAT_ADDED:
+            ei.ei_seat_bind_capabilities(
+                ctypes.c_void_p(ei.ei_event_get_seat(ev)),
+                ctypes.c_int(EI_DEVICE_CAP_POINTER),
+                ctypes.c_int(EI_DEVICE_CAP_BUTTON),
+                ctypes.c_int(EI_DEVICE_CAP_SCROLL),
+                None)
+        elif t == EI_EVENT_DISCONNECT:
+            print("EIS disconnected")
+            quit_with(3)
+        elif not self.active:
+            return
+        elif t == EI_EVENT_POINTER_MOTION:
+            dx = ei.ei_event_pointer_get_dx(ev) * self.a.scale
+            dy = ei.ei_event_pointer_get_dy(ev) * self.a.scale
+            self.motion(dx, dy)
+        elif t == EI_EVENT_BUTTON_BUTTON:
+            self.button(ei.ei_event_button_get_button(ev),
+                        ei.ei_event_button_get_is_press(ev))
+        elif t == EI_EVENT_SCROLL_DISCRETE:
+            self.last_discrete = time.monotonic()
+            steps = ei.ei_event_scroll_get_discrete_dy(ev) / 120
+            self.scroll(steps * self.a.scroll)
+        elif t == EI_EVENT_SCROLL_DELTA:
+            # Wheels send discrete + smooth; only touchpads get here alone.
+            if time.monotonic() - self.last_discrete > 0.2:
+                self.scroll(ei.ei_event_scroll_get_dy(ev) * self.a.scale)
+
+    # The phone's own "scroll" packet scrolls the first scrollable view it
+    # finds (on YouTube: the seek bar). Swipe at the pointer instead.
+    def scroll(self, dy):
+        if not dy or self.left_down:
+            return
+        self.scroll_acc += dy
+        if self.scroll_timer is None:
+            self.scroll_timer = GLib.timeout_add(50, self.swipe)
+
+    def swipe(self):
+        self.scroll_timer = None
+        dist, self.scroll_acc = self.scroll_acc, 0.0
+        if not self.active:
+            return False
+        # Wheel down = content down = finger moves up.
+        up = dist > 0
+        room = (self.py if up else self.a.phone_h - self.py) - 10
+        d = int(min(abs(dist), room))
+        if d < 10:
+            return False
+        self.flush()
+        steps = max(1, d // 40)
+        sign = -1 if up else 1
+        self.phone.command(singlehold=True)          # finger down
+        for i in range(steps):
+            part = d * (i + 1) // steps - d * i // steps
+            self.phone.move(0, sign * part)
+        for _ in range(self.a.settle):               # hold still: no fling
+            self.phone.move(0, -sign)
+            self.phone.move(0, sign)
+        self.phone.command(singlerelease=True)       # finger up
+        self.phone.move(0, -sign * d)                # pointer back
+        return False
+
+    def motion(self, dx, dy):
+        nx, ny = self.px + dx, self.py + dy
+        cx = min(max(nx, 0.0), self.a.phone_w)
+        cy = min(max(ny, 0.0), self.a.phone_h)
+        e = self.edge
+        # overshoot past the entry edge, in the direction back to the PC
+        over = (nx - cx) * e.ox + (ny - cy) * e.oy
+        if over > 0:
+            self.push += over
+            if self.push > self.a.return_push and not self.left_down:
+                self.release()
+                return
+        elif dx * e.ox + dy * e.oy < 0:
+            self.push = 0.0
+        self.px, self.py = cx, cy
+        self.acc_x += dx
+        self.acc_y += dy
+        if self.left_down:
+            self.drag_dist += abs(dx) + abs(dy)
+            if not self.drag and self.drag_dist > self.a.drag_threshold:
+                self.drag = True
+                self.phone.command(singlehold=True)
+
+    def button(self, btn, press):
+        if btn == BTN_LEFT:
+            if press:
+                self.left_down, self.drag, self.drag_dist = True, False, 0.0
+                return
+            self.flush()
+            self.phone.command(**({"singlerelease": True} if self.drag
+                                  else {"singleclick": True}))
+            self.left_down = self.drag = False
+        elif press and btn == BTN_RIGHT:
+            self.phone.command(rightclick=True)
+        elif press and btn == BTN_MIDDLE:
+            self.phone.command(middleclick=True)
+
+    def flush(self):
+        ix, iy = int(self.acc_x), int(self.acc_y)
+        if self.active and (ix or iy):
+            self.phone.move(ix, iy)
+            self.acc_x -= ix
+            self.acc_y -= iy
+        return True
+
+
+exit_code = 0
+
+
+def quit_with(code):
+    # Exceptions inside D-Bus/GLib callbacks don't end the process.
+    global exit_code
+    exit_code = code
+    loop.quit()
+
+
+def default_device():
+    """The only paired device, else the only reachable paired phone.
+
+    Waits (polling) while that is ambiguous, e.g. at login before any phone
+    has connected.
+    """
+    said = False
+    while True:
+        try:
+            obj = bus.get_object("org.kde.kdeconnect", "/modules/kdeconnect")
+            daemon = dbus.Interface(obj, "org.kde.kdeconnect.daemon")
+            paired = [str(d) for d in daemon.devices(False, True)]
+            if len(paired) == 1:
+                return paired[0]
+            reachable = [str(d) for d in daemon.devices(True, True)]
+            if len(reachable) == 1:
+                return reachable[0]
+            reason = f"{len(paired)} paired, {len(reachable)} reachable"
+        except dbus.DBusException as e:
+            reason = f"kdeconnectd not available ({e.get_dbus_name()})"
+        if not said:
+            print(f"waiting for one phone ({reason}); "
+                  "set --device to pick one (kdeconnect-cli -l)")
+            said = True
+        time.sleep(10)
+
+
+def pair(cast):
+    return lambda s: tuple(cast(v) for v in s.split(","))
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--device",
+                    help="KDE Connect device id (kdeconnect-cli -a --id-only); "
+                         "default: the only paired device")
+    ap.add_argument("--edge", choices=OUTWARD, default="right",
+                    help="screen edge the phone sits beyond (default: right)")
+    ap.add_argument("--zone", type=pair(int),
+                    help="any point X,Y on the screen the phone sits next to; "
+                         "default: the outermost screen on that edge")
+    ap.add_argument("--span", type=pair(float), default=(0.0, 1.0),
+                    help="stretch of that edge, as fractions FROM,TO "
+                         "(left-to-right or top-to-bottom)")
+    ap.add_argument("--line", type=int, default=3,
+                    help="edge line thickness in px, 0 to hide")
+    ap.add_argument("--phone-w", type=int, default=1080,
+                    help="phone screen width, px (default: 1080)")
+    ap.add_argument("--phone-h", type=int, default=2400,
+                    help="phone screen height, px (default: 2400)")
+    ap.add_argument("--scale", type=float, default=2.0,
+                    help="phone px per PC px of motion")
+    ap.add_argument("--scroll", type=float, default=250,
+                    help="phone px of swipe per wheel notch")
+    ap.add_argument("--settle", type=int, default=4,
+                    help="tiny moves before lifting the finger; 0 lets it fling")
+    ap.add_argument("--hz", type=int, default=60, help="motion send rate")
+    ap.add_argument("--return-push", type=float, default=150,
+                    help="phone px to push back out of the phone to return")
+    ap.add_argument("--drag-threshold", type=float, default=20,
+                    help="phone px moved with left held before it becomes a drag")
+    ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
+    args = ap.parse_args()
+    args.device = args.device or default_device()
+
+    sys.stdout.reconfigure(line_buffering=True)
+    global loop
+    loop = GLib.MainLoop()
+    Bridge(args).start()
+    signal.signal(signal.SIGINT, lambda *_: loop.quit())
+    signal.signal(signal.SIGTERM, lambda *_: loop.quit())
+    loop.run()
+    sys.exit(exit_code)
+
+
+if __name__ == "__main__":
+    main()

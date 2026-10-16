@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 720" width="960" height="720" font-family="Inter, 'Noto Sans', 'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <linearGradient id="wall" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1d2a3a"/>
+      <stop offset="1" stop-color="#2c3e50"/>
+    </linearGradient>
+    <linearGradient id="phonescr" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#26313d"/>
+      <stop offset="1" stop-color="#1b232c"/>
+    </linearGradient>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#f67400"/>
+    </marker>
+    <marker id="arrowgrey" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#8a96a3"/>
+    </marker>
+    <symbol id="cursor" viewBox="0 0 16 24">
+      <path d="M1,1 L1,19 L5.5,14.8 L8.6,22 L11.4,20.8 L8.4,13.8 L14.5,13.8 z" fill="#ffffff" stroke="#111" stroke-width="1.3" stroke-linejoin="round"/>
+    </symbol>
+  </defs>
+
+  <!-- card -->
+  <rect x="0" y="0" width="960" height="720" rx="18" fill="#f4f6f8"/>
+
+  <!-- main monitor -->
+  <rect x="60" y="40" width="600" height="352" rx="14" fill="#15191e"/>
+  <rect x="72" y="52" width="576" height="324" fill="url(#wall)"/>
+  <!-- windows on the monitor -->
+  <rect x="104" y="84" width="300" height="190" rx="6" fill="#eef1f4" opacity="0.92"/>
+  <rect x="104" y="84" width="300" height="22" rx="6" fill="#d5dbe1"/>
+  <rect x="116" y="122" width="200" height="9" rx="4" fill="#b9c2cc"/>
+  <rect x="116" y="142" width="250" height="9" rx="4" fill="#c9d0d8"/>
+  <rect x="116" y="162" width="170" height="9" rx="4" fill="#c9d0d8"/>
+  <rect x="430" y="120" width="190" height="130" rx="6" fill="#eef1f4" opacity="0.85"/>
+  <rect x="430" y="120" width="190" height="22" rx="6" fill="#d5dbe1"/>
+  <!-- panel -->
+  <rect x="72" y="352" width="576" height="24" fill="#0f1418" opacity="0.9"/>
+  <circle cx="90" cy="364" r="7" fill="#3daee9"/>
+  <rect x="110" y="358" width="14" height="12" rx="2" fill="#56616d"/>
+  <rect x="132" y="358" width="14" height="12" rx="2" fill="#56616d"/>
+  <rect x="154" y="358" width="14" height="12" rx="2" fill="#56616d"/>
+  <rect x="600" y="358" width="36" height="12" rx="2" fill="#56616d"/>
+
+  <!-- the edge line: left quarter of the bottom edge -->
+  <rect x="72" y="372" width="144" height="4" fill="#f67400"/>
+
+  <!-- second screen (laptop) -->
+  <rect x="680" y="40" width="240" height="160" rx="10" fill="#15191e"/>
+  <rect x="690" y="50" width="220" height="140" fill="url(#wall)"/>
+  <rect x="706" y="66" width="120" height="76" rx="4" fill="#eef1f4" opacity="0.85"/>
+  <path d="M664,204 L936,204 L920,216 L680,216 z" fill="#2a3138"/>
+
+  <!-- phone -->
+  <rect x="86" y="430" width="140" height="272" rx="20" fill="#0d0f12"/>
+  <rect x="93" y="440" width="126" height="252" rx="14" fill="url(#phonescr)"/>
+  <circle cx="156" cy="450" r="3" fill="#000"/>
+  <!-- phone content: a feed -->
+  <rect x="103" y="466" width="106" height="58" rx="6" fill="#c0392b" opacity="0.85"/>
+  <polygon points="149,484 149,506 167,495" fill="#fff"/>
+  <rect x="103" y="530" width="80" height="6" rx="3" fill="#8a96a3"/>
+  <rect x="103" y="542" width="60" height="6" rx="3" fill="#56616d"/>
+  <rect x="103" y="560" width="106" height="58" rx="6" fill="#2980b9" opacity="0.85"/>
+  <rect x="103" y="624" width="88" height="6" rx="3" fill="#8a96a3"/>
+  <rect x="103" y="636" width="54" height="6" rx="3" fill="#56616d"/>
+  <rect x="103" y="654" width="106" height="30" rx="6" fill="#27ae60" opacity="0.7"/>
+
+  <!-- cursor path: from the monitor, through the edge line, onto the phone -->
+  <path d="M300,232 C250,300 170,330 150,372 C140,395 140,440 150,488" fill="none" stroke="#f67400" stroke-width="3" stroke-dasharray="8 7" marker-end="url(#arrow)"/>
+  <use href="#cursor" x="292" y="222" width="20" height="30" opacity="0.55"/>
+  <use href="#cursor" x="168" y="496" width="20" height="30"/>
+
+  <!-- way back -->
+  <path d="M206,600 C232,540 232,450 196,392" fill="none" stroke="#8a96a3" stroke-width="2.5" stroke-dasharray="4 6" marker-end="url(#arrowgrey)"/>
+
+  <!-- callouts -->
+  <g font-size="17" fill="#1f2933">
+    <line x1="220" y1="374" x2="300" y2="430" stroke="#1f2933" stroke-width="1.2"/>
+    <circle cx="220" cy="374" r="3" fill="#1f2933"/>
+    <text x="306" y="432" font-weight="700">Edge line</text>
+    <text x="306" y="454" font-size="15" fill="#52606d">a thin bar on the part of the edge the phone sits</text>
+    <text x="306" y="474" font-size="15" fill="#52606d">beyond — blue when idle, orange while the phone</text>
+    <text x="306" y="494" font-size="15" fill="#52606d">has the mouse</text>
+
+    <text x="306" y="544" font-weight="700">Cross it and the pointer lands on the phone</text>
+    <text x="306" y="566" font-size="15" fill="#52606d">at the matching position; click = tap, drag = touch</text>
+    <text x="306" y="586" font-size="15" fill="#52606d">drag, wheel = swipe, right = back, middle = home</text>
+
+    <text x="306" y="636" font-weight="700">Push back up past the phone's top edge</text>
+    <text x="306" y="658" font-size="15" fill="#52606d">and the mouse returns to the PC where you left</text>
+    <text x="306" y="678" font-size="15" fill="#52606d">(or press Meta+Shift+Esc any time)</text>
+  </g>
+
+  <text x="940" y="706" font-size="12" fill="#8a96a3" text-anchor="end">illustration — not a screenshot</text>
+</svg>
