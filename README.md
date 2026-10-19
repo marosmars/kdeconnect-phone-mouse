@@ -23,6 +23,8 @@ have.
   pointer, right click = Back, middle click = Home.
 - **Only while connected**: the edge is armed only while KDE Connect reports
   the phone reachable. Otherwise the screen edge behaves normally.
+- **Only while charging** (optional, `--require-charging`): arm the edge only
+  while the phone charges, e.g. sits on its charging stand.
 - **Survives monitor changes**: when the screen layout changes, the service
   restarts with the new layout.
 
@@ -122,6 +124,7 @@ All options are command-line flags. For the service, put them in `ARGS=` in
 | `--settle` | `4` | Hold-still steps before lifting the finger. `0` lets lists fling |
 | `--return-push` | `150` | How far (phone px) to push out of the phone before returning |
 | `--line` | `3` | Edge line thickness in px, `0` hides it |
+| `--require-charging` | off | Arm the edge only while the phone is charging (KDE Connect battery plugin must be on) |
 | `--device` | the only paired device, else the only reachable one | KDE Connect device id, from `kdeconnect-cli -l` |
 
 Example: phone lying below the left quarter of the screen at 0,0:

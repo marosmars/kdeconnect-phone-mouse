@@ -16,7 +16,7 @@ https://github.com/marosmars/kdeconnect-phone-mouse
 SPDX-License-Identifier: MIT
 """
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 import argparse
 import ctypes
@@ -152,11 +152,26 @@ class Phone:
         except dbus.DBusException:
             return False  # kdeconnectd not running, or device unknown
 
+    def charging(self):
+        try:
+            obj = bus.get_object("org.kde.kdeconnect", f"{self.dev_path}/battery",
+                                 introspect=False)
+            return bool(dbus.Interface(obj, dbus.PROPERTIES_IFACE).Get(
+                "org.kde.kdeconnect.device.battery", "isCharging"))
+        except dbus.DBusException:
+            return False  # battery plugin off, or phone away
+
     def watch(self, callback):
-        """Call callback(bool) on reachability changes (signal + 30 s poll)."""
-        bus.add_signal_receiver(lambda r: callback(bool(r)), "reachableChanged",
+        """Call callback() when reachability or charging may have changed
+        (signals + 30 s poll)."""
+        bus.add_signal_receiver(lambda *a: callback(), "reachableChanged",
                                 "org.kde.kdeconnect.device", None, self.dev_path)
-        GLib.timeout_add_seconds(30, lambda: callback(self.reachable()) or True)
+        bus.add_signal_receiver(lambda *a: callback(), "refreshed",
+                                "org.kde.kdeconnect.device.battery", None,
+                                f"{self.dev_path}/battery")
+        bus.add_signal_receiver(lambda *a: callback(), "PropertiesChanged",
+                                dbus.PROPERTIES_IFACE, None, f"{self.dev_path}/battery")
+        GLib.timeout_add_seconds(30, lambda: callback() or True)
 
     def _ignore(self, *a):
         pass
@@ -339,11 +354,18 @@ class Bridge:
                 print(f"no edge line ({e}); "
                       "sudo apt install gir1.2-gtklayershell-0.1", file=sys.stderr)
         self.enabled = None
-        self.phone.watch(self.set_enabled)
-        self.set_enabled(self.phone.reachable())
+        self.phone.watch(self.update_enabled)
+        self.update_enabled()
 
-    def set_enabled(self, on):
-        """Hold the barrier only while the phone is reachable."""
+    def update_enabled(self):
+        """Hold the barrier only while the phone is reachable
+        (and charging, with --require-charging)."""
+        reachable = self.phone.reachable()
+        charging = self.phone.charging() if reachable and self.a.require_charging else None
+        self.set_enabled(reachable and charging is not False,
+                         "away" if not reachable else "not charging")
+
+    def set_enabled(self, on, why_off="away"):
         if on == self.enabled:
             return
         self.enabled = on
@@ -355,7 +377,7 @@ class Bridge:
             self.capture.disable()
         if self.indicator:
             self.indicator.set_visible(on)
-        print(f"phone {'reachable: cross the ' + self.a.edge + ' edge' if on else 'away: edge off'}")
+        print(f"phone {'ready: cross the ' + self.a.edge + ' edge' if on else why_off + ': edge off'}")
 
     def check_screens(self):
         # Screens changed: geometry is stale. Let systemd restart us.
@@ -393,8 +415,8 @@ class Bridge:
     def on_disabled(self):
         # Meta+Shift+Esc: KWin dropped the barrier. Put it back.
         self.set_active(False)
-        print("capture disabled (escape key), re-arming")
         if self.enabled:
+            print("capture disabled (escape key), re-arming")
             GLib.timeout_add(1000, lambda: self.capture.enable(*self.edge.barrier()))
 
     def release(self):
@@ -597,6 +619,9 @@ def main():
                     help="phone px to push back out of the phone to return")
     ap.add_argument("--drag-threshold", type=float, default=20,
                     help="phone px moved with left held before it becomes a drag")
+    ap.add_argument("--require-charging", action="store_true",
+                    help="arm the edge only while the phone is charging "
+                         "(e.g. on its stand)")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = ap.parse_args()
     args.device = args.device or default_device()

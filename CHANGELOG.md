@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.0 — 2026-10-19
+
+- `--require-charging`: arm the edge only while the phone is charging,
+  e.g. on its charging stand. Uses the KDE Connect battery plugin.
+
 ## 0.1.0 — 2026-10-16
 
 First release.
