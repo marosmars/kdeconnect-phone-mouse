@@ -18,7 +18,7 @@ https://github.com/marosmars/kdeconnect-phone-mouse
 SPDX-License-Identifier: MIT
 """
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 import argparse
 import ctypes
@@ -27,6 +27,7 @@ import json
 import subprocess
 import signal
 import sys
+import tempfile
 import time
 
 import dbus
@@ -223,7 +224,8 @@ class SwitcherWindow:
 
     KWin lists a window in Alt+Tab only once it has had focus, so it starts
     unminimized, takes focus once, and then minimizes itself. It lives for
-    the whole session (re-adding it would flash it again)."""
+    the whole session (re-adding it would flash it again); while the phone
+    is off, a KWin script hides it from the task bar and Alt+Tab."""
 
     def __init__(self, name, on_pick):
         import gi
@@ -250,7 +252,31 @@ class SwitcherWindow:
         if not self.ready:
             self.ready = True
             self.win.iconify()
+            self.apply_skip()
         return False
+
+    def apply_skip(self):
+        """Hide the window from the task bar and Alt+Tab while the phone is
+        off. GTK3 has no Wayland skip-taskbar, so ask KWin via a script."""
+        skip = "false" if self.available else "true"
+        js = (f"for (const w of workspace.windowList()) if (w.pid === {os.getpid()}"
+              f" && w.normalWindow) {{ w.skipTaskbar = {skip}; w.skipSwitcher = {skip};"
+              f" w.skipPager = {skip}; }}")
+        name = f"phone-mouse-skip-{os.getpid()}"
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+            f.write(js)
+        try:
+            kwin = bus.get_object(KWIN, "/Scripting")
+            kwin.unloadScript(name, dbus_interface="org.kde.kwin.Scripting")
+            sid = kwin.loadScript(f.name, name, dbus_interface="org.kde.kwin.Scripting",
+                                  signature="ss")
+            bus.get_object(KWIN, f"/Scripting/Script{sid}").run(
+                dbus_interface="org.kde.kwin.Script")
+            kwin.unloadScript(name, dbus_interface="org.kde.kwin.Scripting")
+        except dbus.DBusException as e:
+            print("task bar hide failed:", e, file=sys.stderr)
+        finally:
+            os.unlink(f.name)
 
     def on_active(self, w, _pspec):
         if not w.is_active():
@@ -258,6 +284,7 @@ class SwitcherWindow:
         GLib.idle_add(w.iconify)
         if not self.ready:                           # the first, startup focus
             self.ready = True
+            self.apply_skip()
         elif self.available:
             self.on_pick()
 
@@ -267,6 +294,8 @@ class SwitcherWindow:
         self.label.set_text(
             f"Mouse and keyboard are on {self.name}.\nAlt+Tab or push back out to return."
             if on else f"{self.name} is not ready (away or not charging).")
+        if self.ready:
+            self.apply_skip()
 
 
 def screens():

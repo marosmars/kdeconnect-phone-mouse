@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.3.1 — 2026-11-10
+
+- The phone's Alt+Tab window now leaves the task bar and Alt+Tab while the
+  phone is away (or not charging, with `--require-charging`), and comes back
+  when it is ready.
+
 ## 0.3.0 — 2026-11-10
 
 - Keyboard: while the phone has the mouse, typing goes to the focused text
