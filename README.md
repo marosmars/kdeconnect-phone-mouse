@@ -19,6 +19,11 @@ have.
   spot.
 - **Edge line**: a thin click-through bar marks the crossing area. It is blue
   when idle and orange while the phone has the mouse.
+- **Keyboard**: while the phone has the mouse, typing goes to the text field
+  you clicked on the phone. No keyboard switch on the phone needed.
+- **Alt+Tab**: the phone shows up as a window in Alt+Tab and the task bar.
+  Pick it to jump onto the phone (the pointer lands in the middle of its
+  screen). Alt+Tab on the phone jumps back to the PC.
 - **Phone input**: click = tap, drag = touch drag, wheel = swipe under the
   pointer, right click = Back, middle click = Home.
 - **Only while connected**: the edge is armed only while KDE Connect reports
@@ -33,12 +38,12 @@ have.
 ```mermaid
 flowchart LR
     subgraph PC["PC (KDE Plasma, Wayland)"]
-        K["KWin<br/>input capture"] -- "barrier hit,<br/>raw motion / buttons / wheel (libei)" --> S["kdeconnect-phone-mouse"]
+        K["KWin<br/>input capture"] -- "barrier hit,<br/>raw motion / buttons / wheel / keys (libei)" --> S["kdeconnect-phone-mouse"]
         S -- "D-Bus" --> D["kdeconnectd"]
     end
     D -- "LAN" --> A
     subgraph Phone["Android phone"]
-        A["KDE Connect app<br/>Mouse receiver"] --> P["on-screen pointer,<br/>taps & swipes<br/>(accessibility service)"]
+        A["KDE Connect app<br/>Mouse receiver,<br/>Remote keyboard"] --> P["on-screen pointer,<br/>taps, swipes, typing<br/>(accessibility service)"]
     end
 ```
 
@@ -49,8 +54,16 @@ flowchart LR
 3. The script forwards motion, clicks and wheel to the phone through KDE
    Connect's `remotecontrol` D-Bus API. On the phone, KDE Connect's
    **Mouse receiver** plugin draws a pointer and performs taps and swipes.
-4. The script tracks the phone pointer. When you push back out of the edge
+4. Keys go to KDE Connect's `remotekeyboard` D-Bus API. On the phone, the
+   **Remote keyboard** plugin types them into the focused text field through
+   the same accessibility service.
+5. The script tracks the phone pointer. When you push back out of the edge
    you came in through, it releases the capture at the matching PC position.
+
+Alt+Tab: the script keeps a minimized window named after the phone. When
+KWin activates it (Alt+Tab, task bar), the script pushes the PC pointer
+across the barrier through KWin's EIS remote-desktop endpoint, and step 2
+follows. Alt+Tab while on the phone releases the capture.
 
 ## Requirements
 
@@ -58,7 +71,7 @@ flowchart LR
 |---|---|
 | PC | KDE Plasma **6.6** on **Wayland** (tested: Kubuntu 26.04, Plasma 6.6.6), KDE Connect, Python 3, `python3-dbus`, `python3-gi`, `libei1`, `kscreen-doctor` (`libkscreen-bin`) |
 | PC, for the edge line | `gir1.2-gtklayershell-0.1`, `python3-gi-cairo` |
-| Phone | KDE Connect for Android, paired with the PC; Android 8+ for drag |
+| Phone | KDE Connect for Android, paired with the PC; Android 8+ for drag and typing |
 
 Debian / Ubuntu:
 
@@ -73,6 +86,8 @@ sudo apt install python3-dbus python3-gi python3-gi-cairo libei1 \
 
 1. KDE Connect → your PC → ⋮ → **Plugin settings** → turn on
    **Mouse receiver**.
+   For typing, also turn on **Remote keyboard** (the accessibility one,
+   not the input-method one).
 2. Grant its accessibility permission when asked. If it doesn't ask:
    Settings → Accessibility → Downloaded apps → KDE Connect → on.
 3. Let KDE Connect run in the background (battery optimisation off).
@@ -125,6 +140,8 @@ All options are command-line flags. For the service, put them in `ARGS=` in
 | `--return-push` | `150` | How far (phone px) to push out of the phone before returning |
 | `--line` | `3` | Edge line thickness in px, `0` hides it |
 | `--require-charging` | off | Arm the edge only while the phone is charging (KDE Connect battery plugin must be on) |
+| `--no-keyboard` | keyboard on | Leave the keyboard on the PC while the phone has the mouse |
+| `--no-alt-tab` | Alt+Tab on | No phone window in Alt+Tab and the task bar |
 | `--device` | the only paired device, else the only reachable one | KDE Connect device id, from `kdeconnect-cli -l` |
 
 Example: phone lying below the left quarter of the screen at 0,0:
@@ -136,10 +153,9 @@ ARGS=--edge bottom --zone 0,0 --span 0,0.25 --phone-w 1440 --phone-h 3120
 ## Getting your mouse back
 
 - Push back out of the phone through the edge you came in.
-- **Meta+Shift+Esc** always releases the pointer (KWin's built-in escape).
-  The edge re-arms a second later.
-- The keyboard is never captured, so stopping the service always works:
-  `systemctl --user stop kdeconnect-phone-mouse`.
+- **Alt+Tab** on the phone.
+- **Meta+Shift+Esc** always releases the pointer and keyboard (KWin's
+  built-in escape). The edge re-arms a second later.
 
 ## Limitations
 
@@ -151,10 +167,19 @@ ARGS=--edge bottom --zone 0,0 --span 0,0.25 --phone-w 1440 --phone-h 3120
   The public InputCapture portal would avoid that, but on Plasma 6.6 it asks
   permission on every start, shows a notification on every crossing, and only
   accepts barriers that span a whole screen edge.
-- **Pointer only.** The keyboard stays on the PC.
-- **Scrolling is swipe-based.** Each wheel notch is a short swipe under the
-  pointer. KDE Connect's own scroll command scrolls the first scrollable view
-  on screen instead (on YouTube, the seek bar).
+- **Keyboard: US layout only.** Letters, digits and symbols, plus Enter,
+  Backspace, Delete, Tab, Esc, arrows, Home/End, Page Up/Down and
+  Ctrl+A/C/V/X. No dead keys or accented characters. Needs a KDE Connect for
+  Android with the accessibility **Remote keyboard** plugin (2026 and later);
+  without it, keys typed on the phone are lost.
+- **Alt+Tab window flashes once.** KWin lists a window in Alt+Tab only after
+  it had focus, so the phone window shows for a moment when the service
+  starts, then minimizes itself.
+- **Scrolling is swipe-based and a bit choppy.** Each wheel notch is a short
+  swipe under the pointer. KDE Connect's own scroll command scrolls the first
+  scrollable view on screen instead (on YouTube, the seek bar). The phone
+  draws its pointer at the swiping finger, so the pointer twitches while
+  scrolling; longer, smoother drags make it travel further.
 - **Latency** is what KDE Connect over Wi-Fi gives you: fine for tapping
   around, not for games.
 - The phone pointer position is estimated on the PC side. If you also touch

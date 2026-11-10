@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.0 — 2026-11-10
+
+- Keyboard: while the phone has the mouse, typing goes to the focused text
+  field on the phone (US layout; Enter, Backspace, Delete, arrows, Home/End,
+  Tab, Esc, Ctrl+A/C/V/X). Needs the phone's **Remote keyboard** plugin.
+  `--no-keyboard` keeps the keyboard on the PC.
+- Alt+Tab: a minimized window named after the phone sits in Alt+Tab and the
+  task bar. Picking it sends the mouse and keyboard to the phone; Alt+Tab
+  on the phone returns to the PC. `--no-alt-tab` turns it off.
+
 ## 0.2.0 — 2026-10-19
 
 - `--require-charging`: arm the edge only while the phone is charging,

@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Phone (KDE Connect mouse)
+Comment=Picked in Alt+Tab: move the mouse and keyboard onto the phone
+Icon=smartphone
+Exec=true
+NoDisplay=true

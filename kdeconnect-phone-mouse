@@ -5,18 +5,20 @@ Android phone, as if the phone were another monitor.
 PC side:   KWin's input-capture D-Bus API (what the InputCapture portal uses
            underneath, minus the permission dialog) puts a pointer barrier
            on a stretch of one screen edge; once crossed, libei delivers raw
-           pointer events. A thin line on that edge marks the crossing.
-Phone side: KDE Connect remotecontrol plugin (D-Bus) -> Android
-           "Mouse receiver" plugin (accessibility service).
+           pointer and keyboard events. A thin line on that edge marks the
+           crossing. A minimized window puts the phone in Alt+Tab.
+Phone side: KDE Connect remotecontrol / remotekeyboard plugins (D-Bus) ->
+           Android "Mouse receiver" / "Remote keyboard" plugins
+           (accessibility service).
 
 Return to the PC by pushing back out of the phone's entry edge, or
-Meta+Shift+Esc.
+Meta+Shift+Esc, or Alt+Tab.
 
 https://github.com/marosmars/kdeconnect-phone-mouse
 SPDX-License-Identifier: MIT
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 import argparse
 import ctypes
@@ -36,14 +38,18 @@ from gi.repository import GLib
 EI_EVENT_CONNECT = 1
 EI_EVENT_DISCONNECT = 2
 EI_EVENT_SEAT_ADDED = 3
+EI_EVENT_DEVICE_RESUMED = 8
 EI_EVENT_DEVICE_START_EMULATING = 200
 EI_EVENT_DEVICE_STOP_EMULATING = 201
 EI_EVENT_POINTER_MOTION = 300
 EI_EVENT_BUTTON_BUTTON = 500
 EI_EVENT_SCROLL_DELTA = 600
 EI_EVENT_SCROLL_DISCRETE = 603
+EI_EVENT_KEYBOARD_KEY = 700
 
 EI_DEVICE_CAP_POINTER = 1 << 0
+EI_DEVICE_CAP_POINTER_ABSOLUTE = 1 << 1
+EI_DEVICE_CAP_KEYBOARD = 1 << 2
 EI_DEVICE_CAP_SCROLL = 1 << 4
 EI_DEVICE_CAP_BUTTON = 1 << 5
 
@@ -67,6 +73,21 @@ for name, res, args in [
     ("ei_event_button_get_is_press", ctypes.c_bool, [P]),
     ("ei_event_scroll_get_dy", ctypes.c_double, [P]),
     ("ei_event_scroll_get_discrete_dy", ctypes.c_int32, [P]),
+    ("ei_event_keyboard_get_key", ctypes.c_uint32, [P]),
+    ("ei_event_keyboard_get_key_is_press", ctypes.c_bool, [P]),
+]:
+    fn = getattr(ei, name)
+    fn.restype, fn.argtypes = res, args
+for name, res, args in [
+    ("ei_new_sender", P, [P]),
+    ("ei_event_get_device", P, [P]),
+    ("ei_device_has_capability", ctypes.c_bool, [P, ctypes.c_int]),
+    ("ei_device_start_emulating", None, [P, ctypes.c_uint32]),
+    ("ei_device_pointer_motion", None, [P, ctypes.c_double, ctypes.c_double]),
+    ("ei_device_pointer_motion_absolute", None, [P, ctypes.c_double, ctypes.c_double]),
+    ("ei_device_frame", None, [P, ctypes.c_uint64]),
+    ("ei_now", ctypes.c_uint64, [P]),
+    ("ei_unref", P, [P]),
 ]:
     fn = getattr(ei, name)
     fn.restype, fn.argtypes = res, args
@@ -87,10 +108,11 @@ class KWinCapture:
     as a(u(ii)(ii)) with ids. Both are handled.
     """
 
-    def __init__(self, on_activated, on_deactivated, on_disabled):
+    def __init__(self, on_activated, on_deactivated, on_disabled, keyboard):
         mgr = dbus.Interface(bus.get_object(KWIN, "/org/kde/KWin/EIS/InputCapture"),
                              "org.kde.KWin.EIS.InputCaptureManager")
-        self.path = mgr.addInputCapture(dbus.UInt32(2))  # pointer only
+        # 1 = keyboard, 2 = pointer
+        self.path = mgr.addInputCapture(dbus.UInt32(3 if keyboard else 2))
         obj = bus.get_object(KWIN, self.path)
         self.cap = dbus.Interface(obj, CAPTURE_IFACE)
         xml = obj.Introspect(dbus_interface="org.freedesktop.DBus.Introspectable")
@@ -119,6 +141,134 @@ class KWinCapture:
         self.cap.release(dbus.Struct((float(x), float(y)), signature="dd"), True)
 
 
+class Pusher:
+    """Moves the PC pointer through KWin's EIS remote-desktop endpoint (the
+    one the RemoteDesktop portal uses, minus the dialog). Used to push the
+    pointer across the barrier when the phone is picked in Alt+Tab."""
+
+    def __init__(self):
+        self.ctx = None
+        self.rel = self.abs = None
+        self.queued = None
+
+    def connect(self):
+        rd = dbus.Interface(bus.get_object(KWIN, "/org/kde/KWin/EIS/RemoteDesktop"),
+                            "org.kde.KWin.EIS.RemoteDesktop")
+        fd, _cookie = rd.connectToEIS(dbus.Int32(2))  # pointer
+        self.ctx = ei.ei_new_sender(None)
+        ei.ei_configure_name(self.ctx, b"phone-mouse-switch")
+        if ei.ei_setup_backend_fd(self.ctx, fd.take()) != 0:
+            raise OSError("ei_setup_backend_fd failed")
+        self.watch = GLib.io_add_watch(ei.ei_get_fd(self.ctx), GLib.IO_IN, self.on_ei)
+
+    def on_ei(self, fd, cond):
+        ei.ei_dispatch(self.ctx)
+        while True:
+            ev = ei.ei_get_event(self.ctx)
+            if not ev:
+                break
+            t = ei.ei_event_get_type(ev)
+            if t == EI_EVENT_SEAT_ADDED:
+                ei.ei_seat_bind_capabilities(
+                    ctypes.c_void_p(ei.ei_event_get_seat(ev)),
+                    ctypes.c_int(EI_DEVICE_CAP_POINTER),
+                    ctypes.c_int(EI_DEVICE_CAP_POINTER_ABSOLUTE), None)
+            elif t == EI_EVENT_DEVICE_RESUMED:
+                dev = ei.ei_event_get_device(ev)
+                ei.ei_device_start_emulating(dev, 1)
+                if ei.ei_device_has_capability(dev, EI_DEVICE_CAP_POINTER):
+                    self.rel = dev
+                if ei.ei_device_has_capability(dev, EI_DEVICE_CAP_POINTER_ABSOLUTE):
+                    self.abs = dev
+            elif t == EI_EVENT_DISCONNECT:
+                ei.ei_event_unref(ev)
+                GLib.source_remove(self.watch)
+                self.ctx = self.rel = self.abs = None
+                return False
+            ei.ei_event_unref(ev)
+        if self.queued and self.rel and self.abs:
+            self.push(*self.queued)
+        return True
+
+    def push(self, x, y, dx, dy):
+        """Put the pointer at (x, y), then move it by (dx, dy) in small steps."""
+        self.queued = (x, y, dx, dy)
+        if self.ctx is None:
+            self.connect()
+        if not (self.rel and self.abs):
+            return  # devices not there yet; on_ei retries
+        self.queued = None
+
+        def frame(dev):
+            ei.ei_device_frame(dev, ei.ei_now(self.ctx))
+            ei.ei_dispatch(self.ctx)
+
+        ei.ei_device_pointer_motion_absolute(self.abs, float(x), float(y))
+        frame(self.abs)
+        steps = [i for i in range(5)]
+
+        def step():
+            if not steps or not self.rel:
+                return False
+            steps.pop()
+            ei.ei_device_pointer_motion(self.rel, dx / 5, dy / 5)
+            frame(self.rel)
+            return True
+        GLib.timeout_add(10, step)
+
+
+class SwitcherWindow:
+    """A normal window named after the phone. It stays minimized; picking it
+    in Alt+Tab (or the task bar) sends the mouse and keyboard to the phone.
+
+    KWin lists a window in Alt+Tab only once it has had focus, so it starts
+    unminimized, takes focus once, and then minimizes itself. It lives for
+    the whole session (re-adding it would flash it again)."""
+
+    def __init__(self, name, on_pick):
+        import gi
+        gi.require_version("Gtk", "3.0")
+        from gi.repository import Gtk
+        self.name, self.on_pick = name, on_pick
+        self.ready = False
+        w = self.win = Gtk.Window()
+        w.set_icon_name("smartphone")
+        w.set_default_size(420, 140)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8,
+                      margin=24, valign=Gtk.Align.CENTER)
+        box.add(Gtk.Image.new_from_icon_name("smartphone", Gtk.IconSize.DIALOG))
+        self.label = Gtk.Label(justify=Gtk.Justification.CENTER)
+        box.add(self.label)
+        w.add(box)
+        w.connect("delete-event", lambda *_: w.iconify() or True)
+        w.connect("notify::is-active", self.on_active)
+        self.set_available(False)
+        w.show_all()
+        GLib.timeout_add(1500, self.settle)          # never got focus: give up
+
+    def settle(self):
+        if not self.ready:
+            self.ready = True
+            self.win.iconify()
+        return False
+
+    def on_active(self, w, _pspec):
+        if not w.is_active():
+            return
+        GLib.idle_add(w.iconify)
+        if not self.ready:                           # the first, startup focus
+            self.ready = True
+        elif self.available:
+            self.on_pick()
+
+    def set_available(self, on):
+        self.available = on
+        self.win.set_title(f"{self.name} (phone)" if on else f"{self.name} (phone, off)")
+        self.label.set_text(
+            f"Mouse and keyboard are on {self.name}.\nAlt+Tab or push back out to return."
+            if on else f"{self.name} is not ready (away or not charging).")
+
+
 def screens():
     """Logical geometry (x, y, w, h) of enabled outputs, from kscreen-doctor."""
     out = json.loads(subprocess.run(["kscreen-doctor", "-j"], capture_output=True,
@@ -143,6 +293,9 @@ class Phone:
         obj = bus.get_object("org.kde.kdeconnect", f"{self.dev_path}/remotecontrol",
                              introspect=False)
         self.rc = dbus.Interface(obj, "org.kde.kdeconnect.device.remotecontrol")
+        obj = bus.get_object("org.kde.kdeconnect", f"{self.dev_path}/remotekeyboard",
+                             introspect=False)
+        self.kb = dbus.Interface(obj, "org.kde.kdeconnect.device.remotekeyboard")
 
     def reachable(self):
         try:
@@ -151,6 +304,14 @@ class Phone:
                 "org.kde.kdeconnect.device", "isReachable"))
         except dbus.DBusException:
             return False  # kdeconnectd not running, or device unknown
+
+    def name(self):
+        try:
+            obj = bus.get_object("org.kde.kdeconnect", self.dev_path, introspect=False)
+            return str(dbus.Interface(obj, dbus.PROPERTIES_IFACE).Get(
+                "org.kde.kdeconnect.device", "name"))
+        except dbus.DBusException:
+            return "Phone"
 
     def charging(self):
         try:
@@ -185,11 +346,39 @@ class Phone:
             reply_handler=self._ignore, error_handler=self._err,
         )
 
+    def key(self, text, special, shift, ctrl, alt):
+        self.kb.sendKeyPress(
+            text, dbus.Int32(special), shift, ctrl, alt, False,
+            signature="sibbbb",
+            reply_handler=self._ignore, error_handler=self._err,
+        )
+
     def command(self, **body):
         self.rc.sendCommand(
             dbus.Dictionary(body, signature="sv"),
             reply_handler=self._ignore, error_handler=self._err,
         )
+
+
+# --- keyboard ----------------------------------------------------------------
+
+# evdev key code -> (plain, shifted), US layout
+KEYMAP = {}
+for row, plain, shifted in [
+    (2, "1234567890-=", "!@#$%^&*()_+"),
+    (16, "qwertyuiop[]", "QWERTYUIOP{}"),
+    (30, "asdfghjkl;'`", 'ASDFGHJKL:"~'),
+    (43, "\\zxcvbnm,./", "|ZXCVBNM<>?"),
+]:
+    for i, (a, b) in enumerate(zip(plain, shifted)):
+        KEYMAP[row + i] = (a, b)
+KEYMAP[57] = (" ", " ")
+
+# evdev key code -> KDE Connect special key
+SPECIAL = {14: 1, 15: 2, 105: 4, 103: 5, 106: 6, 108: 7, 104: 8, 109: 9,
+           102: 10, 107: 11, 28: 12, 96: 12, 111: 13, 1: 14}
+SHIFT, CTRL, ALT = {42, 54}, {29, 97}, {56, 100}
+CAPSLOCK = 58
 
 
 # --- geometry ----------------------------------------------------------------
@@ -323,6 +512,9 @@ class Bridge:
         self.last_discrete = 0.0
         self.scroll_acc = 0.0            # pending scroll, phone px of finger travel
         self.scroll_timer = None
+        self.picked = 0.0                # when the phone was picked in Alt+Tab
+        self.mods = set()                # held modifier keys
+        self.caps = False
 
     def start(self):
         self.screens = screens()
@@ -338,7 +530,7 @@ class Bridge:
         print(f"screen {zone}, barrier {self.edge.barrier()}")
 
         self.capture = KWinCapture(self.on_activated, self.on_deactivated,
-                                   self.on_disabled)
+                                   self.on_disabled, self.a.keyboard)
         self.ctx = ei.ei_new_receiver(None)
         ei.ei_configure_name(self.ctx, b"phone-mouse")
         if ei.ei_setup_backend_fd(self.ctx, self.capture.connect_eis()) != 0:
@@ -353,6 +545,10 @@ class Bridge:
             except (ImportError, ValueError) as e:
                 print(f"no edge line ({e}); "
                       "sudo apt install gir1.2-gtklayershell-0.1", file=sys.stderr)
+        self.switcher = None
+        if self.a.alt_tab:
+            self.pusher = Pusher()
+            self.switcher = SwitcherWindow(self.phone.name(), self.goto_phone)
         self.enabled = None
         self.phone.watch(self.update_enabled)
         self.update_enabled()
@@ -377,7 +573,23 @@ class Bridge:
             self.capture.disable()
         if self.indicator:
             self.indicator.set_visible(on)
+        if self.switcher:
+            self.switcher.set_available(on)
         print(f"phone {'ready: cross the ' + self.a.edge + ' edge' if on else why_off + ': edge off'}")
+
+    def goto_phone(self):
+        """Picked in Alt+Tab: push the pointer across the barrier; it lands
+        in the middle of the phone screen."""
+        if self.active or not self.enabled:
+            return
+        e = self.edge
+        x1, y1, x2, y2 = e.barrier()
+        x, y = (x1 + x2) / 2 + e.ox * 10, (y1 + y2) / 2 + e.oy * 10
+        self.picked = time.monotonic()
+        try:
+            self.pusher.push(x, y, -e.ox * 50, -e.oy * 50)
+        except (dbus.DBusException, OSError) as err:
+            print("alt-tab switch failed:", err, file=sys.stderr)
 
     def check_screens(self):
         # Screens changed: geometry is stale. Let systemd restart us.
@@ -402,10 +614,14 @@ class Bridge:
             position = rest[0]
         cx, cy = (float(v) for v in position)
         self.px, self.py = self.edge.phone_entry(cx, cy)
+        if time.monotonic() - self.picked < 1.0:     # came from Alt+Tab
+            self.px, self.py = self.a.phone_w / 2, self.a.phone_h / 2
+        self.picked = 0.0
         self.phone.command(x=dbus.Int32(max(1, int(self.px))),
                            y=dbus.Int32(max(1, int(self.py))))
         self.push = 0.0
         self.acc_x = self.acc_y = 0.0
+        self.mods.clear()
         self.set_active(True)
         print(f"-> phone at {int(self.px)},{int(self.py)}")
 
@@ -445,6 +661,7 @@ class Bridge:
                 ctypes.c_int(EI_DEVICE_CAP_POINTER),
                 ctypes.c_int(EI_DEVICE_CAP_BUTTON),
                 ctypes.c_int(EI_DEVICE_CAP_SCROLL),
+                ctypes.c_int(EI_DEVICE_CAP_KEYBOARD),
                 None)
         elif t == EI_EVENT_DISCONNECT:
             print("EIS disconnected")
@@ -462,6 +679,9 @@ class Bridge:
             self.last_discrete = time.monotonic()
             steps = ei.ei_event_scroll_get_discrete_dy(ev) / 120
             self.scroll(steps * self.a.scroll)
+        elif t == EI_EVENT_KEYBOARD_KEY:
+            self.key(ei.ei_event_keyboard_get_key(ev),
+                     ei.ei_event_keyboard_get_key_is_press(ev))
         elif t == EI_EVENT_SCROLL_DELTA:
             # Wheels send discrete + smooth; only touchpads get here alone.
             if time.monotonic() - self.last_discrete > 0.2:
@@ -537,6 +757,30 @@ class Bridge:
             self.phone.command(rightclick=True)
         elif press and btn == BTN_MIDDLE:
             self.phone.command(middleclick=True)
+
+    def key(self, code, press):
+        if code == 15 and self.mods & ALT:      # Alt+Tab: back to the PC
+            if press:
+                self.release()
+            return
+        if code in SHIFT | CTRL | ALT:
+            (self.mods.add if press else self.mods.discard)(code)
+            return
+        if not press:
+            return
+        if code == CAPSLOCK:
+            self.caps = not self.caps
+            return
+        shift = bool(self.mods & SHIFT)
+        ctrl = bool(self.mods & CTRL)
+        alt = bool(self.mods & ALT)
+        if code in SPECIAL:
+            self.phone.key("", SPECIAL[code], shift, ctrl, alt)
+        elif code in KEYMAP:
+            plain, shifted = KEYMAP[code]
+            upper = shift != (self.caps and plain.isalpha())
+            # Send the final character; the phone treats shift as selection.
+            self.phone.key(shifted if upper else plain, 0, False, ctrl, alt)
 
     def flush(self):
         ix, iy = int(self.acc_x), int(self.acc_y)
@@ -622,11 +866,16 @@ def main():
     ap.add_argument("--require-charging", action="store_true",
                     help="arm the edge only while the phone is charging "
                          "(e.g. on its stand)")
+    ap.add_argument("--no-keyboard", dest="keyboard", action="store_false",
+                    help="leave the keyboard on the PC while the phone has the mouse")
+    ap.add_argument("--no-alt-tab", dest="alt_tab", action="store_false",
+                    help="no phone window in Alt+Tab")
     ap.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     args = ap.parse_args()
     args.device = args.device or default_device()
 
     sys.stdout.reconfigure(line_buffering=True)
+    GLib.set_prgname("kdeconnect-phone-mouse")  # Wayland app id, for the icon
     global loop
     loop = GLib.MainLoop()
     Bridge(args).start()
